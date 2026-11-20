@@ -135,7 +135,7 @@ function boot(ST) {
       let ws
       try { ws = new WebSocket(url, ['mqtt']) } catch (e) { return reject(e) }
       ws.binaryType = 'arraybuffer'
-      let buf = new Uint8Array(0), done = false, pid = 1, pinger = null
+      let buf = new Uint8Array(0), done = false, pid = 1, pinger = null, lastRx = Date.now()
       const client = {
         url, onMessage: null, onClose: null,
         send(b) { if (ws.readyState === 1) ws.send(b) },
@@ -151,6 +151,7 @@ function boot(ST) {
         client.send(packet(0x10, mstr('MQTT'), [4, flags], u16(120), payload))
       }
       ws.onmessage = (ev) => {
+        lastRx = Date.now()
         buf = cat(buf, new Uint8Array(ev.data))
         for (;;) {
           if (buf.length < 2) break
@@ -163,7 +164,10 @@ function boot(ST) {
             clearTimeout(timer)
             if (body[1] === 0) {
               done = true
-              pinger = setInterval(() => client.send(Uint8Array.from([0xc0, 0])), 40000)
+              pinger = setInterval(() => {
+                if (Date.now() - lastRx > 60000) { try { ws.close() } catch {} return }
+                client.send(Uint8Array.from([0xc0, 0]))
+              }, 20000)
               resolve(client)
             } else if (!done) { done = true; reject(new Error('服务器拒绝连接 ' + body[1])); ws.close() }
           } else if (type === 3) {
@@ -266,9 +270,13 @@ function boot(ST) {
 
   async function publish(sub, obj, retain) {
     const c = room.crypto, cl = conn.client
-    if (!c || !cl) return
+    if (!c || !cl || !conn.open) return false
     cl.publish(c.base + '/' + sub, obj === null ? new Uint8Array(0) : await c.seal(obj), retain)
+    return true
   }
+  // 断线期间自己的操作：重连后再决定要不要补发
+  let offlinePending = null
+  let resyncing = false
   const sendEvent = obj => publish('e', { ...obj, v: PROTOCOL, from: room.you, n: ++myEvt, at: Date.now() })
   async function publishPresence() {
     const p = await profile()
@@ -338,7 +346,7 @@ function boot(ST) {
       const localAt = m.at - offOf(m.by)
       if (room.state && localAt < room.stateAt - 50) return
       room.state = m; room.stateAt = localAt
-      if (!room.code) return // 还在找房间，加入成功后再应用
+      if (!room.code || resyncing) return // 还在找房间 / 重连对齐中，稍后统一处理
       ui.render()
       applyState(m, '同步')
       return
@@ -392,8 +400,26 @@ function boot(ST) {
     const code = room.code, you = room.you, url = conn.broker
     setTimeout(async () => {
       if (room.code !== code || core.disposed) return
-      try { await attach(url, you); retry = 0; await publishPresence(); pingPeers(); ui.status('已重新连接'); ui.render() } catch { onClosed(conn.client = client) }
+      try { await attach(url, you); retry = 0; await publishPresence(); pingPeers(); ui.status('已重新连接'); ui.render(); resyncAfterReconnect() } catch { onClosed(conn.client = client) }
     }, Math.min(1000 * 2 ** retry++, 15000))
+  }
+
+  // 重连后：等服务器把房间最新状态推过来，再看谁的操作更新——
+  // 自己断线期间的操作更新，就补发给好友；好友那边更新，就跟着好友走
+  async function resyncAfterReconnect() {
+    resyncing = true
+    await sleep(1500)
+    resyncing = false
+    if (!room.code) return
+    const p = offlinePending
+    offlinePending = null
+    const st = room.state
+    if (st && st.by !== room.you && !(p && p.at >= room.stateAt)) {
+      applyState(st, '重连同步')
+    } else if (p || (st && st.by === room.you)) {
+      await broadcastLocal(p ? p.reason : (st.reason || 'seek'))
+      if (p) ui.toast('已把断线期间的操作同步给好友')
+    }
   }
 
   // 心跳：在线信息每 30 秒刷新一次，时钟每 15 秒校一次，清理掉线的人
@@ -502,7 +528,7 @@ function boot(ST) {
       at: Date.now(),
     }
     room.state = state; room.stateAt = state.at
-    await publish('s', state, true)
+    if (!(await publish('s', state, true))) offlinePending = { reason, at: state.at }
     ui.render()
   }
 
@@ -700,6 +726,8 @@ function boot(ST) {
 .st-top:hover .st-a{transform:translateX(-1px)}
 .st-top:hover .st-b{transform:translateX(1px)}
 .st-top.on{color:var(--st-green);background:rgba(0,203,100,.14)}
+.st-top.on.reconnecting{color:#ffbe50;background:rgba(255,190,80,.14)}
+.st-top.on.reconnecting .st-eq i{animation:none;height:3px}
 .st-top.on .st-stack .st-b{box-shadow:0 0 0 1.5px #0f2c1d}
 .st-top.on:hover{background:rgba(0,203,100,.2)}
 .st-top.st-in{animation:st-pop .5s var(--st-spring) both}
@@ -864,7 +892,7 @@ function boot(ST) {
       entry.classList.toggle('on', on)
       const b = on && o.length ? av(o[0], 'st-b') : `<div class="st-av st-b plus">${PLUS}</div>`
       entry.innerHTML = `<div class="st-stack">${av(on ? meM() : me, 'st-a')}${b}</div>
-        <div class="st-lbl">${on ? '<span class="st-eq"><i></i><i></i><i></i></span>' + (o.length ? '一起听中' : '等待好友') : '双人一起听'}</div>`
+        <div class="st-lbl">${on ? '<span class="st-eq"><i></i><i></i><i></i></span>' + (!conn.open ? '重连中…' : o.length ? '一起听中' : '等待好友') : '双人一起听'}</div>`
     }
 
     // ---- 入口 2：顶栏「一起听」胶囊（每个页面都有），放在「AI 写歌」左边 ----
@@ -892,8 +920,9 @@ function boot(ST) {
       const o = others()
       const on = inRoom()
       mini.classList.toggle('on', on)
+      mini.classList.toggle('reconnecting', on && !conn.open)
       const b = on && o.length ? av(o[0], 'st-b') : `<div class="st-av st-b plus">${PLUS}</div>`
-      mini.innerHTML = `<div class="st-stack">${av(on ? meM() : me, 'st-a')}${b}</div>${on ? '<span class="st-eq"><i></i><i></i><i></i></span>' + (o.length ? '一起听中' : '等待好友') : '一起听'}`
+      mini.innerHTML = `<div class="st-stack">${av(on ? meM() : me, 'st-a')}${b}</div>${on ? '<span class="st-eq"><i></i><i></i><i></i></span>' + (!conn.open ? '重连中…' : o.length ? '一起听中' : '等待好友') : '一起听'}`
     }
 
     // 页面一渲染就同步插入入口（不等定时器），切换页面回来时不会「晚一拍」才冒出来
