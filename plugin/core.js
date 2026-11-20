@@ -619,6 +619,36 @@ function boot(ST) {
   }, 500)
   onDispose(resetRate)
 
+  // ---------------- 新版本提醒 ----------------
+  const REPO = window.__SODA_TOGETHER_REPO__ || '7zxic/soda-together'
+  const RELEASES_URL = 'https://github.com/' + REPO + '/releases/latest'
+  const isNewer = (a, b) => {
+    const pa = a.split(/[.-]/).map(Number), pb = b.split(/[.-]/).map(Number)
+    for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0) }
+    return false
+  }
+  async function checkUpdate() {
+    const cur = String(ST.version || '')
+    if (!/^\d+\.\d+\.\d+/.test(cur)) return // 开发版不检查
+    let latest = LS.get('latestVersion', '')
+    if (Date.now() - Number(LS.get('updateCheckedAt', 0)) > 6 * 3600e3) {
+      try {
+        const r = await fetch('https://api.github.com/repos/' + REPO + '/releases/latest', { headers: { Accept: 'application/vnd.github+json' }, cache: 'no-store' })
+        if (r.ok) {
+          const j = await r.json()
+          latest = String(j.tag_name || '').replace(/^v/, '')
+          LS.set('latestVersion', latest)
+          LS.set('updateCheckedAt', String(Date.now()))
+        }
+      } catch {}
+    }
+    core.update = /^\d+\.\d+\.\d+/.test(latest) && isNewer(latest, cur) ? latest : null
+    ui.render()
+  }
+  core.checkUpdate = checkUpdate
+  setTimeout(checkUpdate, 8000)
+  every(checkUpdate, 6 * 3600e3)
+
   // ---------------- 房间操作 ----------------
   // 去掉了容易看错的 I O 0 1
   const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -637,7 +667,7 @@ function boot(ST) {
     recomputeMembers()
     pingPeers()
     ui.render()
-    if (creating) { await broadcastLocal('create'); ui.toast(`房间已创建：${formatCode(code)}`) }
+    if (creating) { LS.set('lastCreated', code); await broadcastLocal('create'); ui.toast(`房间已创建：${formatCode(code)}`) }
     else {
       ui.toast(`已加入房间 ${formatCode(code)}`)
       if (room.state) applyState(room.state, '加入房间')
@@ -830,6 +860,13 @@ function boot(ST) {
 .st-emoji:active{transform:scale(.88)}
 .st-chat input{flex:1;min-width:0;height:34px;padding:0 14px;border:0;border-radius:17px;background:rgba(255,255,255,.07);color:#fff;font-size:13px;outline:none;user-select:text}
 .st-chat input:focus{box-shadow:0 0 0 1px rgba(0,203,100,.5)}
+.st-detect{display:flex;align-items:center;gap:10px;padding:10px 12px;margin:0 0 14px;border-radius:14px;background:rgba(0,203,100,.1);box-shadow:inset 0 0 0 1px rgba(0,203,100,.28);animation:st-up .45s var(--st-out) both}
+.st-detect .t{flex:1;min-width:0;font-size:12px;color:rgba(255,255,255,.65)}
+.st-detect b{display:block;margin-top:2px;color:#fff;font-size:14px;letter-spacing:1px}
+.st-detect .st-btn{width:auto;height:32px;padding:0 14px;font-size:13px;flex:none}
+.st-update{margin-top:12px;text-align:center;font-size:12px;color:var(--st-green);cursor:pointer}
+.st-update:hover{text-decoration:underline}
+.st-top .st-new{position:absolute;right:-1px;top:-1px;width:7px;height:7px;border-radius:50%;background:var(--st-green);box-shadow:0 0 0 2px #2b2b2b}
 .st-foot{margin-top:14px;display:flex;justify-content:space-between;align-items:center;font-size:11px;color:rgba(255,255,255,.28)}
 .st-link{cursor:pointer;color:rgba(255,255,255,.45)}
 .st-link:hover{color:var(--st-green)}
@@ -924,7 +961,7 @@ function boot(ST) {
       mini.classList.toggle('on', on)
       mini.classList.toggle('reconnecting', on && !conn.open)
       const b = on && o.length ? av(o[0], 'st-b') : `<div class="st-av st-b plus">${PLUS}</div>`
-      mini.innerHTML = `<div class="st-stack">${av(on ? meM() : me, 'st-a')}${b}</div>${on ? '<span class="st-eq"><i></i><i></i><i></i></span>' + (!conn.open ? '重连中…' : o.length ? '一起听中' : '等待好友') : '一起听'}`
+      mini.innerHTML = `<div class="st-stack">${av(on ? meM() : me, 'st-a')}${b}</div>${on ? '<span class="st-eq"><i></i><i></i><i></i></span>' + (!conn.open ? '重连中…' : o.length ? '一起听中' : '等待好友') : '一起听'}${core.update ? '<i class="st-new"></i>' : ''}`
     }
 
     // 页面一渲染就同步插入入口（不等定时器），切换页面回来时不会「晚一拍」才冒出来
@@ -951,6 +988,7 @@ function boot(ST) {
 
     function open(from) {
       anchor = from
+      setTimeout(detectClipboard, 0)
       backdrop = document.createElement('div')
       backdrop.className = 'st-backdrop'
       backdrop.addEventListener('mousedown', close)
@@ -979,6 +1017,10 @@ function boot(ST) {
     function onKey(e) { if (e.key === 'Escape' && sheet) close() }
     document.addEventListener('keydown', onKey)
     onDispose(() => document.removeEventListener('keydown', onKey))
+    // 面板开着时切到微信复制了房间码再切回来，也能识别
+    const onFocus = () => { if (sheet && !inRoom()) detectClipboard() }
+    window.addEventListener('focus', onFocus)
+    onDispose(() => window.removeEventListener('focus', onFocus))
 
     // 定位在入口旁边，并把缩放原点设在入口中心
     function place() {
@@ -1038,12 +1080,31 @@ function boot(ST) {
       return `<div class="st-code ${readonly ? 'ro' : ''}">${s}${readonly ? '' : `<input data-k="code" maxlength="20" value="${esc(v)}" spellcheck="false" autocomplete="off" placeholder="粘贴或输入房间码">`}</div>`
     }
 
+    const updateHtml = () => core.update ? `<div class="st-update" data-a="update">发现新版本 v${esc(core.update)}，点击下载</div>` : ''
+
+    // 打开面板时看看剪贴板里有没有好友发来的房间码（只认 XXXX-XXXX-XXXX 格式，或剪贴板里只有 12 位房间码）
+    let detectedCode = ''
+    async function detectClipboard() {
+      if (inRoom()) return
+      let text = ''
+      try { text = String(await navigator.clipboard.readText() || '') } catch { return }
+      const up = text.toUpperCase()
+      const m = up.match(/(?:^|[^A-Z0-9])([A-HJ-NP-Z2-9]{4})-([A-HJ-NP-Z2-9]{4})-([A-HJ-NP-Z2-9]{4})(?![A-Z0-9])/) || up.trim().match(/^([A-HJ-NP-Z2-9]{4})([A-HJ-NP-Z2-9]{4})([A-HJ-NP-Z2-9]{4})$/)
+      const c = m ? m[1] + m[2] + m[3] : ''
+      const next = c && c !== LS.get('lastCreated', '') ? c : ''
+      if (next === detectedCode) return
+      detectedCode = next
+      if (next) codeDraft = next
+      render()
+    }
+
     function lobbyHtml() {
       return `
         ${heroHtml()}
         <h3>双人一起听</h3>
         <div class="st-sub">邀请好友实时同步收听<br>切歌、暂停、拖动进度都会一起变化</div>
-        <button class="st-btn primary" data-a="create">创建房间并邀请好友</button>
+        ${detectedCode ? `<div class="st-detect"><div class="t">检测到好友的房间码<b>${esc(formatCode(detectedCode))}</b></div><button class="st-btn primary" data-a="joinDetected">一键加入</button></div>` : ''}
+        <button class="st-btn ${detectedCode ? 'ghost' : 'primary'}" data-a="create">创建房间并邀请好友</button>
         <div class="st-divider">或输入好友的房间码</div>
         ${codeBoxes(codeDraft, false)}
         <div style="height:12px"></div>
@@ -1051,7 +1112,8 @@ function boot(ST) {
         ${editingServer ? `
           <div class="st-srv"><input data-k="server" value="${esc(customBroker())}" placeholder="wss://你的服务器:端口/mqtt" spellcheck="false"><button class="st-btn primary" data-a="saveServer">保存</button></div>
           <div class="st-foot"><span>自定义服务器：双方需填写相同地址，留空则使用默认</span><span class="st-link" data-a="closeServer">收起</span></div>`
-        : `<div class="st-foot"><span>${customBroker() ? '使用自定义服务器' : '无需服务器，直接连接好友'}</span><span class="st-link" data-a="server">高级</span></div>`}`
+        : `<div class="st-foot"><span>${customBroker() ? '使用自定义服务器' : '无需服务器，直接连接好友'}</span><span class="st-link" data-a="server">高级</span></div>`}
+        ${updateHtml()}`
     }
 
     function roomHtml() {
@@ -1061,11 +1123,12 @@ function boot(ST) {
         ${heroHtml()}
         <h3>${o.length ? (o.length === 1 ? `和 ${esc(o[0].name)} 一起听` : `${room.members.length} 人正在一起听`) : '等待好友加入…'}</h3>
         <div class="st-sub">${o.length ? '你们的播放已同步' : '把房间码发给好友，在TA的汽水里输入即可加入'}</div>
-        <div class="st-coderow">${codeBoxes(room.code, true)}<button class="st-copy" data-a="copy">复制房间码</button></div>
+        <div class="st-coderow">${codeBoxes(room.code, true)}<button class="st-copy" data-a="copy">复制邀请</button></div>
         ${t ? `<div class="st-now"><img src="${esc(t.cover || '')}" onerror="this.style.visibility='hidden'"><div style="min-width:0;flex:1"><div class="t">${esc(t.name)}</div><div class="s">${esc(t.artist)}</div></div></div>` : ''}
         <div class="st-status ${conn.open ? '' : 'off'}"><i></i><span data-r="status">${esc(conn.open ? (statusText || '已连接') : '未连接')}</span><span style="margin-left:auto" data-r="latency">${syncLabel()}</span></div>
         ${o.length ? `<div class="st-chat"><button class="st-emoji" data-a="emoji" data-e="❤️">❤️</button><button class="st-emoji" data-a="emoji" data-e="👍">👍</button><button class="st-emoji" data-a="emoji" data-e="🎵">🎵</button><input data-k="chat" maxlength="60" placeholder="说点什么…"></div>` : ''}
-        <button class="st-btn danger" data-a="leave">退出一起听</button>`
+        <button class="st-btn danger" data-a="leave">退出一起听</button>
+        ${updateHtml()}`
     }
 
     function bind(focused) {
@@ -1122,8 +1185,19 @@ function boot(ST) {
         toast(v ? '已切换到自定义服务器' : '已恢复默认')
       }
       if (a === 'copy') {
-        try { await navigator.clipboard.writeText(formatCode(room.code)); toast('房间码已复制，发给好友吧') } catch { toast('复制失败，房间码：' + formatCode(room.code)) }
+        const invite = '来汽水音乐一起听歌吧！\n房间码：' + formatCode(room.code) + '\n打开汽水顶栏的「一起听」就能自动识别加入。\n还没装插件？在这里下载：' + RELEASES_URL
+        try { await navigator.clipboard.writeText(invite); toast('邀请已复制，发给好友吧') } catch {
+          try { await ST.invoke('utils', 'copyToClipboard', [invite]); toast('邀请已复制，发给好友吧') } catch { toast('复制失败，房间码：' + formatCode(room.code)) }
+        }
       }
+      if (a === 'joinDetected') {
+        e.currentTarget.disabled = true; e.currentTarget.textContent = '加入中…'
+        const c = detectedCode
+        detectedCode = ''
+        await joinRoom(c)
+        render()
+      }
+      if (a === 'update') ST.invoke('utils', 'openUrl', [RELEASES_URL]).catch(() => { try { window.open(RELEASES_URL) } catch {} })
     }
 
     function shakeCode() {

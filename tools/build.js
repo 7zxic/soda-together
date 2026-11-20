@@ -20,7 +20,7 @@ fs.mkdirSync(dist, { recursive: true })
 // 1. 插件脚本（正式版，不带开发模式）。开头的标记和版本号供安装器识别。
 const read = f => fs.readFileSync(path.join(root, 'plugin', f), 'utf8')
 const plugin = ['together.js', 'core.js'].map(f => `/* ${f} */\n` + read(f)).join('\n;\n')
-const bundle = `/* ${MARK} soda-together v${version} */\n;try{(function(){\nwindow.__SODA_TOGETHER_VERSION__=${JSON.stringify(version)};\n${plugin}\n})()}catch(e){console.error('[soda-together]',e)}\n`
+const bundle = `/* ${MARK} soda-together v${version} */\n;try{(function(){\nwindow.__SODA_TOGETHER_VERSION__=${JSON.stringify(version)};\nwindow.__SODA_TOGETHER_REPO__=${JSON.stringify(process.env.GITHUB_REPOSITORY || '7zxic/soda-together')};\n${plugin}\n})()}catch(e){console.error('[soda-together]',e)}\n`
 const bundlePath = path.join(dist, 'soda-together.js')
 fs.writeFileSync(bundlePath, bundle, 'utf8')
 
