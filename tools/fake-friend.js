@@ -8,7 +8,7 @@ const code = (process.argv[2] || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
 const listenOnly = process.argv.includes('--listen')
 const STAY = Number(process.env.STAY_MS) || 30000
 if (!code) { console.log('用法: node fake-friend.js <房间码> [--listen]'); process.exit(1) }
-const BROKERS = ['wss://broker-cn.emqx.io:8084/mqtt', 'wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt']
+const BROKERS = process.env.BROKER ? [process.env.BROKER] : ['wss://broker-cn.emqx.io:8084/mqtt', 'wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt']
 
 const enc = new TextEncoder(), dec = new TextDecoder()
 const cat = (...p) => Buffer.concat(p.map(x => Buffer.from(x)))

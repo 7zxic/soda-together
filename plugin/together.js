@@ -4,27 +4,74 @@
   const orig = window.transportPort
   if (!orig) return
 
+  const VERSION = window.__SODA_TOGETHER_VERSION__ || 'dev'
+  const TEST = window.__SODA_TOGETHER_TEST__ || {}
+
+  // ---- 0. 兼容性保护：汽水更新后如果插件和新版本不兼容，宁可不启动，也不能让汽水白屏 ----
+  // 用汽水入口脚本的文件名当「汽水版本标识」（每次汽水更新文件名里的哈希都会变）
+  const BUILD = (() => {
+    try {
+      const s = document.querySelector('script[type="module"][src]')
+      return s ? s.getAttribute('src').split('/').pop() : location.pathname
+    } catch { return '' }
+  })()
+  const DISABLED_KEY = 'sodaTogether.disabled'
+  const readDisabled = () => { try { return JSON.parse(localStorage.getItem(DISABLED_KEY) || 'null') } catch { return null } }
+  const off = readDisabled()
+  if (off && off.build === BUILD && off.version === VERSION) {
+    // 上次在这个汽水版本上出过问题：这次不接管，汽水原样运行。汽水或插件更新后会自动再试
+    console.warn('[soda-together] 已在此汽水版本上停用：', off.reason)
+    window.__sodaTogether = { disabled: true, reason: off.reason }
+    return
+  }
+  function disableAndReload(reason) {
+    try { localStorage.setItem(DISABLED_KEY, JSON.stringify({ build: BUILD, version: VERSION, reason, at: Date.now() })) } catch {}
+    console.warn('[soda-together] 与当前汽水版本不兼容，已停用并刷新：', reason)
+    if (TEST.onDisable) return TEST.onDisable(reason)
+    location.reload()
+  }
+
+  // 通道结构必须和预期完全一致才接管；汽水改了内部实现就直接不启动
+  const EXPECTED = ['receiveTransport', 'registerTransport', 'sendTransport']
+  const keys = Object.keys(orig).sort()
+  if (keys.join() !== EXPECTED.join() || EXPECTED.some(k => typeof orig[k] !== 'function')) {
+    console.warn('[soda-together] 汽水内部结构已变化，插件不启动：', keys.join())
+    window.__sodaTogether = { disabled: true, reason: 'shape ' + keys.join() }
+    return
+  }
+
   // ---- 1. 接管 transportPort：汽水的消息照常转发，插件自己的请求/回调由插件处理 ----
   const PREFIX = 'st-'
   const pending = new Map() // requestId -> resolve(return)
   const callbacks = new Map() // callbackId -> fn
   let appCb = null
   const early = []
+  let forwarded = 0
+  let errors = 0
+  let passthrough = false // 插件自己处理消息时反复出错，就只转发，不再拦截
 
   orig.receiveTransport((msg) => {
-    try {
-      if (msg && msg.type === 'method.return' && typeof msg.requestId === 'string' && msg.requestId.startsWith(PREFIX)) {
-        const done = pending.get(msg.requestId)
-        pending.delete(msg.requestId)
-        if (done) done(msg.return)
+    if (!passthrough) {
+      const ours = msg && ((msg.type === 'method.return' && typeof msg.requestId === 'string' && msg.requestId.startsWith(PREFIX)) ||
+        (msg.type === 'method.callback' && typeof msg.callbackId === 'string' && msg.callbackId.startsWith(PREFIX)))
+      if (ours) {
+        try {
+          if (msg.type === 'method.return') {
+            const done = pending.get(msg.requestId)
+            pending.delete(msg.requestId)
+            if (done) done(msg.return)
+          } else {
+            const fn = callbacks.get(msg.callbackId)
+            if (fn) fn(...(msg.arguments || []))
+          }
+        } catch (e) {
+          console.error('[soda-together]', e)
+          if (++errors >= 20) passthrough = true
+        }
         return
       }
-      if (msg && msg.type === 'method.callback' && typeof msg.callbackId === 'string' && msg.callbackId.startsWith(PREFIX)) {
-        const fn = callbacks.get(msg.callbackId)
-        if (fn) fn(...(msg.arguments || []))
-        return
-      }
-    } catch (e) { console.error('[soda-together]', e) }
+    }
+    forwarded++
     if (appCb) appCb(msg)
     else early.push(msg)
   })
@@ -37,6 +84,15 @@
       while (early.length) cb(early.shift())
     },
   }
+
+  // 看门狗：一段时间后汽水界面还没正常起来（没注册接收、没收到任何消息、页面是空的），
+  // 就当作和这个版本不兼容：记下来并刷新，刷新后插件不再接管，汽水原样运行
+  setTimeout(() => {
+    const root = document.getElementById('app')
+    const rendered = !!(root && root.children.length)
+    if (appCb && forwarded > 0 && rendered) return
+    disableAndReload(!appCb ? 'app never registered' : !forwarded ? 'no messages' : 'app not rendered')
+  }, TEST.watchMs || 45000)
 
   const uid = () => PREFIX + Math.random().toString(36).slice(2) + Date.now().toString(36)
 
@@ -101,7 +157,7 @@
     return readyPromise
   }
 
-  const api = { invoke, results, log, whenAppReady, version: 3, dev: DEV_MODE }
+  const api = { invoke, results, log, whenAppReady, version: VERSION, dev: DEV_MODE }
   window.__sodaTogether = api
   if (!DEV_MODE) return
 
@@ -117,5 +173,5 @@
     } catch {}
   }
   setInterval(pollDev, 2000)
-  results.状态 = '已加载 v3（开发模式）'
+  results.状态 = '已加载 ' + VERSION + '（开发模式）'
 })()

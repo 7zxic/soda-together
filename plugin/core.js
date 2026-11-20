@@ -24,6 +24,7 @@ function installAudioTap(ST) {
           tap.data = new Uint8Array(tap.analyser.frequencyBinCount)
         }
         origConnect.call(this, tap.analyser)
+        tap.media = this.mediaElement || null
       }
     } catch (e) {}
     return ret
@@ -107,11 +108,14 @@ function boot(ST) {
   }
 
   // ---------------- 网络 ----------------
-  const BROKERS = [
+  const DEFAULT_BROKERS = [
     'wss://broker-cn.emqx.io:8084/mqtt',
     'wss://broker.emqx.io:8084/mqtt',
     'wss://broker.hivemq.com:8884/mqtt',
   ]
+  // 高级设置里可以填自己的服务器（MQTT over WebSocket），双方填同一个地址即可
+  const customBroker = () => LS.get('broker', '')
+  const brokers = () => customBroker() ? [customBroker()] : DEFAULT_BROKERS
   const enc = new TextEncoder(), dec = new TextDecoder()
   const cat = (...parts) => {
     const arrs = parts.map(p => p instanceof Uint8Array ? p : Uint8Array.from(p))
@@ -451,7 +455,7 @@ function boot(ST) {
       // 注意：汽水的 seekSeconds 跳转后会自动 resume，所以必须先跳进度、再决定暂停
       if (isStale(s)) { ui.status('等待下一首…'); return }
       const target = expectedPos(s)
-      if (Math.abs(localPos() - target) > 0.4) await ST.invoke('player', 'seekSeconds', [target + (s.playing ? 0.12 : 0)])
+      if (Math.abs(precisePos() - target) > 0.4) await ST.invoke('player', 'seekSeconds', [target + (s.playing ? 0.12 : 0)])
       if (!s.playing) {
         if (local.isPlaying || Math.abs(localPos() - target) > 0.4) await ST.invoke('player', 'suspend', [])
         await waitFor(() => !local.isPlaying, 1500)
@@ -551,20 +555,42 @@ function boot(ST) {
     prevSample = { ...local }
   }
 
-  // 周期性纠偏
+  // ---------------- 纠偏 ----------------
+  // 小偏差：把播放速度微调到 0.95~1.05 倍悄悄追平（浏览器默认保持音调，听不出来）；
+  // 大偏差：直接跳进度。只向「别人发来的」状态纠偏，房间状态是自己发的时，本地播放器就是标准。
+  let correcting = false
+  function currentMedia() {
+    const m = ST.audioTap && ST.audioTap.media
+    if (!m || !m.isConnected && m.readyState === 0) return null
+    // 确认是当前这首歌的播放器：它的进度和汽水报告的进度对得上
+    return Math.abs(m.currentTime - localPos()) < 3 ? m : null
+  }
+  function resetRate() {
+    correcting = false
+    const m = ST.audioTap && ST.audioTap.media
+    if (m && m.playbackRate !== 1) m.playbackRate = 1
+  }
+  const precisePos = () => { const m = currentMedia(); return m ? m.currentTime : localPos() }
   every(() => {
     const s = room.state
-    if (!room.code || !s || applying || Date.now() < suppressUntil) return
-    // 只向「别人发来的」状态纠偏。房间状态是自己发的时，本地播放器就是标准，不能拿旧记录来拉自己
-    if (s.by === room.you || !otherIds().length) return
-    if (isStale(s)) return
-    if (s.track.id !== local.mediaId) return
-    if (s.playing !== local.isPlaying) return
-    if (!s.playing || local.isLoading) return
-    const drift = localPos() - expectedPos(s)
+    if (!room.code || !s || applying || Date.now() < suppressUntil) return resetRate()
+    if (s.by === room.you || !otherIds().length) return resetRate()
+    if (isStale(s) || s.track.id !== local.mediaId || s.playing !== local.isPlaying || !s.playing || local.isLoading) return resetRate()
+    const media = currentMedia()
+    const drift = precisePos() - expectedPos(s)
     core.drift = drift
-    if (Math.abs(drift) > 0.8) { log('drift fix', drift.toFixed(2)); applyState(s, '纠偏') }
-  }, 2000)
+    if (!media || Math.abs(drift) > 1) {
+      resetRate()
+      if (Math.abs(drift) > 0.8) { log('drift seek', drift.toFixed(3)); applyState(s, '纠偏') }
+      return
+    }
+    if (Math.abs(drift) < (correcting ? 0.03 : 0.12)) return resetRate()
+    correcting = true
+    // 调整幅度随偏差变化，最少 2%、最多 5%，最后一点也能较快追平
+    const adj = Math.min(0.05, Math.max(0.02, Math.abs(drift) / 6))
+    media.playbackRate = drift > 0 ? 1 - adj : 1 + adj
+  }, 500)
+  onDispose(resetRate)
 
   // ---------------- 房间操作 ----------------
   // 去掉了容易看错的 I O 0 1
@@ -599,7 +625,7 @@ function boot(ST) {
       const you = newId()
       resetRoom()
       room.crypto = await roomCrypto(code); room.you = you; room.joinedAt = Date.now()
-      for (const url of BROKERS) {
+      for (const url of brokers()) {
         try { await attach(url, you); await enterRoom(code, you, true); return } catch (e) { log('broker fail', url, e.message) }
       }
       resetRoom()
@@ -620,7 +646,7 @@ function boot(ST) {
       room.crypto = await roomCrypto(code); room.you = you; room.joinedAt = Date.now()
       let reachable = 0
       // 房主可能连在任意一个通道上：依次进去看有没有房间成员的在线信息
-      for (const url of BROKERS) {
+      for (const url of brokers()) {
         let client
         try { client = await attach(url, you); reachable++ } catch (e) { log('broker fail', url, e.message); continue }
         const t0 = Date.now()
@@ -636,6 +662,7 @@ function boot(ST) {
   }
 
   function leaveRoom(silent) {
+    resetRate()
     const c = room.crypto, client = conn.client, alone = !otherIds().length
     if (client && c) {
       client.publish(c.base + '/m/' + room.you, new Uint8Array(0), true)
@@ -990,7 +1017,10 @@ function boot(ST) {
         ${codeBoxes(codeDraft, false)}
         <div style="height:12px"></div>
         <button class="st-btn ghost" data-a="join" ${codeDraft.length === CODE_LEN ? '' : 'disabled'}>加入房间</button>
-        <div class="st-foot" style="justify-content:center;gap:6px"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span>端到端加密 · 无需服务器，直接连接好友</span></div>`
+        ${editingServer ? `
+          <div class="st-srv"><input data-k="server" value="${esc(customBroker())}" placeholder="wss://你的服务器:端口/mqtt" spellcheck="false"><button class="st-btn primary" data-a="saveServer">保存</button></div>
+          <div class="st-foot"><span>自定义服务器：双方需填写相同地址，留空则使用默认</span><span class="st-link" data-a="closeServer">收起</span></div>`
+        : `<div class="st-foot"><span>${customBroker() ? '使用自定义服务器' : '无需服务器，直接连接好友'}</span><span class="st-link" data-a="server">高级</span></div>`}`
     }
 
     function roomHtml() {
@@ -1030,6 +1060,8 @@ function boot(ST) {
         chat.addEventListener('keydown', e => { if (e.key === 'Enter' && chat.value.trim()) { sendChat(chat.value.trim()); chat.value = '' } })
         if (focused === 'chat') chat.focus()
       }
+      const srv = sheet.querySelector('input[data-k="server"]')
+      if (srv) srv.addEventListener('keydown', e => { if (e.key === 'Enter') { const b = sheet.querySelector('[data-a="saveServer"]'); if (b) b.click() } })
     }
 
     function sendChat(text) {
@@ -1048,6 +1080,16 @@ function boot(ST) {
       if (a === 'join') { e.currentTarget.disabled = true; e.currentTarget.textContent = '正在寻找房间…'; await joinRoom(codeDraft); render() }
       if (a === 'leave') { leaveRoom(); codeDraft = '' }
       if (a === 'emoji') sendChat(e.currentTarget.dataset.e)
+      if (a === 'server') { editingServer = true; render(); const i = sheet.querySelector('input[data-k="server"]'); if (i) i.focus() }
+      if (a === 'closeServer') { editingServer = false; render() }
+      if (a === 'saveServer') {
+        const v = sheet.querySelector('input[data-k="server"]').value.trim()
+        if (v && !/^wss?:\/\/[^\s/]+(:\d+)?(\/\S*)?$/.test(v)) return toast('地址格式不对，例如 wss://example.com:8084/mqtt')
+        LS.set('broker', v)
+        editingServer = false
+        render()
+        toast(v ? '已切换到自定义服务器' : '已恢复默认')
+      }
       if (a === 'copy') {
         try { await navigator.clipboard.writeText(formatCode(room.code)); toast('房间码已复制，发给好友吧') } catch { toast('复制失败，房间码：' + formatCode(room.code)) }
       }
