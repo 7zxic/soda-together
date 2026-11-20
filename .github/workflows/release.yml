@@ -1,0 +1,54 @@
+# 推送 v* 标签时：构建安装器并发布到 Releases。
+# 发布流程：改 VERSION → 提交 → git tag v1.2.3 → git push --tags
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write      # 创建 Release
+  id-token: write      # 构建来源证明
+  attestations: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 检查标签和 VERSION 一致
+        shell: bash
+        run: |
+          v="$(tr -d '[:space:]' < VERSION)"
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "标签 $GITHUB_REF_NAME 和 VERSION 文件 ($v) 不一致" >&2
+            exit 1
+          fi
+
+      - name: 构建
+        run: node tools/build.js
+
+      - name: 检查打包后的插件
+        run: node --check dist/soda-together.js
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/SodaTogether.exe
+
+      - name: 发布
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          下载 **SodaTogether.exe**，双击运行，点「安装」即可。好友也装好后，在汽水顶栏点「一起听」→ 创建房间 → 把房间码发给好友。
+
+          第一次运行如果出现 Windows「已保护你的电脑」提示：点「更多信息」→「仍要运行」。
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/SodaTogether.exe dist/SHA256SUMS.txt \
+            --title "汽水音乐 · 一起听 $GITHUB_REF_NAME" --notes-file notes.md

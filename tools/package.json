@@ -1,0 +1,8 @@
+{
+  "name": "soda-together-tools",
+  "private": true,
+  "description": "开发和测试工具（构建本身不需要任何依赖）",
+  "devDependencies": {
+    "ws": "8.18.0"
+  }
+}

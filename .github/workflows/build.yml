@@ -1,0 +1,38 @@
+# 每次推送 / PR：检查代码并构建安装器，产物可在 Actions 页面下载
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 检查插件语法
+        run: |
+          node --check plugin/together.js
+          node --check plugin/core.js
+
+      - name: 构建
+        run: node tools/build.js
+
+      - name: 检查打包后的插件
+        run: node --check dist/soda-together.js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SodaTogether
+          path: |
+            dist/SodaTogether.exe
+            dist/SHA256SUMS.txt
