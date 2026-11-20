@@ -1,11 +1,20 @@
 // 测试用：模拟一个好友通过公共 MQTT 通道加入房间，打印收到的同步状态，并按脚本操作。
-// 用法: node fake-friend.js <房间码> [--listen]   (--listen 只听不操作)
+// 用法: node fake-friend.js <房间码> [--listen] [--emoji]
+//       node fake-friend.js new [--emoji]      由模拟好友建房，打印房间码
+//   --listen 只听不操作   --emoji 每隔一段时间发一个表情
+//   环境变量: STAY_MS 停留时长, NAME 显示名称, BROKER 指定服务器
 'use strict'
 const WebSocket = require('ws')
 const { webcrypto: crypto } = require('crypto')
 
-const code = (process.argv[2] || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
-const listenOnly = process.argv.includes('--listen')
+const hostMode = process.argv[2] === 'new'
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const code = hostMode
+  ? [...require('crypto').randomBytes(12)].map(b => CODE_CHARS[b & 31]).join('')
+  : (process.argv[2] || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+const listenOnly = hostMode || process.argv.includes('--listen')
+const emojiMode = process.argv.includes('--emoji')
+const NAME = process.env.NAME || '测试好友'
 const STAY = Number(process.env.STAY_MS) || 30000
 if (!code) { console.log('用法: node fake-friend.js <房间码> [--listen]'); process.exit(1) }
 const BROKERS = process.env.BROKER ? [process.env.BROKER] : ['wss://broker-cn.emqx.io:8084/mqtt', 'wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt']
@@ -85,7 +94,11 @@ function connect(url, clientId, will) {
       }
       if (!payload.length) return
       const m = await cr.open(payload); if (!m) return
-      if (sub === 's' && m.by !== you) { state = m; show('收到状态', m) }
+      if (sub === 's' && m.by !== you) {
+        state = m; show('收到状态', m)
+        // 建房模式下跟随对方：以自己的名义把同样的进度发回去，对方就处于「跟随好友」的状态
+        if (hostMode) setTimeout(() => { if (state === m) act('跟随', { playing: m.playing, pos: expected(m), reason: 'seek' }) }, 1500)
+      }
       if (sub === 'e' && m.from !== you) {
         if (m.t === 'ping' && m.to === you) ev({ t: 'pong', to: m.from, c: m.c, s: Date.now() })
         if (m.t === 'pong' && m.to === you) { const now = Date.now(), rtt = now - m.c; const c0 = clocks.get(m.from); if (!c0 || rtt <= c0.rtt) clocks.set(m.from, { off: m.s - (m.c + now) / 2, rtt }); }
@@ -94,13 +107,21 @@ function connect(url, clientId, will) {
     }
     client.sub(cr.base + '/#')
     const t0 = Date.now()
+    if (hostMode) { console.log(ts(), '已建房 @', url); console.log('\n  房间码：' + code.match(/.{4}/g).join('-') + '\n'); break }
     while (!peers.size && Date.now() - t0 < 2500) await new Promise(r => setTimeout(r, 100))
     if (peers.size) { console.log(ts(), '找到房间 @', url); break }
     console.log('这个通道上没有房间', url); client.close(); client = null
   }
   if (!client) { console.log('没找到房间'); process.exit(1) }
   const joinedAt = Date.now()
-  await send('m/' + you, { v: 2, id: you, name: '测试好友', avatar: '', joinedAt, ts: Date.now() }, true)
+  const presence = () => send('m/' + you, { v: 2, id: you, name: NAME, avatar: '', joinedAt, ts: Date.now() }, true)
+  await presence()
+  setInterval(presence, 30000) // 在线心跳，否则对方 2.5 分钟后会认为已掉线
+  if (emojiMode) {
+    const list = ['❤️', '🎵', '👍']
+    let i = 0
+    setInterval(() => { if (peers.size) { const e = list[i++ % list.length]; console.log(ts(), '>> 发表情', e); ev({ t: 'chat', text: e }) } }, 20000)
+  }
 
   const act = async (label, patch) => {
     if (!state) return
@@ -119,6 +140,7 @@ function connect(url, clientId, will) {
   setTimeout(async () => {
     console.log(ts(), '>> 好友离开', 'clock', JSON.stringify([...clocks.values()]))
     client.pub(cr.base + '/m/' + you, Buffer.alloc(0), true)
+    if (hostMode && !peers.size) client.pub(cr.base + '/s', Buffer.alloc(0), true)
     setTimeout(() => process.exit(0), 500)
   }, STAY)
 })()

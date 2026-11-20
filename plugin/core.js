@@ -605,6 +605,7 @@ function boot(ST) {
     const media = currentMedia()
     const drift = precisePos() - expectedPos(s)
     core.drift = drift
+    core.driftAt = Date.now()
     if (!media || Math.abs(drift) > 1) {
       resetRate()
       if (Math.abs(drift) > 0.8) { log('drift seek', drift.toFixed(3)); applyState(s, '纠偏') }
@@ -630,6 +631,7 @@ function boot(ST) {
 
   async function enterRoom(code, you, creating) {
     room.code = code; room.you = you
+    ui.status('')
     quietUntil = Date.now() + 2500
     await publishPresence()
     recomputeMembers()
@@ -1061,7 +1063,7 @@ function boot(ST) {
         <div class="st-sub">${o.length ? '你们的播放已同步' : '把房间码发给好友，在TA的汽水里输入即可加入'}</div>
         <div class="st-coderow">${codeBoxes(room.code, true)}<button class="st-copy" data-a="copy">复制房间码</button></div>
         ${t ? `<div class="st-now"><img src="${esc(t.cover || '')}" onerror="this.style.visibility='hidden'"><div style="min-width:0;flex:1"><div class="t">${esc(t.name)}</div><div class="s">${esc(t.artist)}</div></div></div>` : ''}
-        <div class="st-status ${conn.open ? '' : 'off'}"><i></i><span data-r="status">${esc(conn.open ? (statusText || '已连接') : '未连接')}</span><span style="margin-left:auto" data-r="latency">${conn.open ? Math.round(conn.rtt) + ' ms' : ''}</span></div>
+        <div class="st-status ${conn.open ? '' : 'off'}"><i></i><span data-r="status">${esc(conn.open ? (statusText || '已连接') : '未连接')}</span><span style="margin-left:auto" data-r="latency">${syncLabel()}</span></div>
         ${o.length ? `<div class="st-chat"><button class="st-emoji" data-a="emoji" data-e="❤️">❤️</button><button class="st-emoji" data-a="emoji" data-e="👍">👍</button><button class="st-emoji" data-a="emoji" data-e="🎵">🎵</button><input data-k="chat" maxlength="60" placeholder="说点什么…"></div>` : ''}
         <button class="st-btn danger" data-a="leave">退出一起听</button>`
     }
@@ -1160,9 +1162,13 @@ function boot(ST) {
       const el = sheet && sheet.querySelector('[data-r="status"]')
       if (el) el.textContent = text
     }
+    function syncLabel() {
+      if (!conn.open || !core.driftAt || Date.now() - core.driftAt > 3000) return ''
+      return '误差 ' + Math.abs(core.drift).toFixed(2) + ' 秒'
+    }
     function tick() {
       const el = sheet && sheet.querySelector('[data-r="latency"]')
-      if (el && conn.open) el.textContent = Math.round(conn.rtt) + ' ms'
+      if (el) el.textContent = syncLabel()
     }
     // ---- 音柱：跟随音乐频谱跳动 ----
     // 三根柱子分别对应低频 / 中频 / 高频；起得快、落得慢，看起来更像真的律动
